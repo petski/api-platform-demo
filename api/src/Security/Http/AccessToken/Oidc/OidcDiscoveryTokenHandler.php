@@ -4,8 +4,16 @@ declare(strict_types=1);
 
 namespace App\Security\Http\AccessToken\Oidc;
 
+use Jose\Component\Checker\AlgorithmChecker;
+use Jose\Component\Checker\ClaimCheckerManager;
+use Jose\Component\Checker\ExpirationTimeChecker;
+use Jose\Component\Checker\HeaderCheckerManager;
+use Jose\Component\Checker\IssuedAtChecker;
+use Jose\Component\Checker\NotBeforeChecker;
+use Jose\Component\Core\JWK;
 use Jose\Component\Core\JWKSet;
 use Jose\Component\Signature\JWSLoader;
+use Jose\Component\Signature\JWSTokenSupport;
 use Psr\Log\LoggerInterface;
 use Symfony\Component\DependencyInjection\Attribute\Autowire;
 use Symfony\Component\Security\Core\Exception\BadCredentialsException;
@@ -20,7 +28,7 @@ use Symfony\Contracts\Cache\ItemInterface;
 use Symfony\Contracts\HttpClient\HttpClientInterface;
 
 /**
- * Completes {@see OidcTokenHandler} with OIDC Discovery and configuration stored in cache.
+ * Based on {@see OidcTokenHandler} with OIDC Discovery and configuration stored in cache.
  */
 final class OidcDiscoveryTokenHandler implements AccessTokenHandlerInterface
 {
@@ -85,10 +93,33 @@ final class OidcDiscoveryTokenHandler implements AccessTokenHandlerInterface
                 signature: $signature,
             );
 
+            // Verify the headers. We only have `alg` and `typ` in the header.
+            $headerCheckerManager = new HeaderCheckerManager(
+                checkers: [
+                    new AlgorithmChecker($this->keysetToSupportedAlgorithms($keyset)), // `alg`, probably "RS256"
+                ],
+                tokenTypes: [
+                    new JWSTokenSupport(), // signed, i.e. not encrypted
+                ],
+            );
+            // if this check fails, an InvalidHeaderException is thrown
+            $headerCheckerManager->check($jws, 0);
+
             $claims = json_decode($jws->getPayload(), true);
             if (empty($claims[$this->claim])) {
                 throw new MissingClaimException(\sprintf('"%s" claim not found.', $this->claim));
             }
+
+            // Verify the claims
+            $claimCheckerManager = new ClaimCheckerManager(
+                checkers: [
+                    new ExpirationTimeChecker(),
+                    new IssuedAtChecker(),
+                    new NotBeforeChecker(),
+                ],
+            );
+            // if this check fails, an InvalidClaimException is thrown
+            $claimCheckerManager->check($claims);
 
             // UserLoader argument can be overridden by a UserProvider on AccessTokenAuthenticator::authenticate
             return new UserBadge($claims[$this->claim], new FallbackUserLoader(fn () => $this->createUser($claims)), $claims);
@@ -100,5 +131,27 @@ final class OidcDiscoveryTokenHandler implements AccessTokenHandlerInterface
 
             throw new BadCredentialsException('Invalid credentials.', $e->getCode(), $e);
         }
+    }
+
+    /**
+     * @return array<string>
+     */
+    private function keysetToSupportedAlgorithms(JWKSet $keyset): array
+    {
+        $algorithms = [];
+
+        /**
+         * @var JWK $key
+         */
+        foreach ($keyset as $key) {
+            $algorithm = $key->get('alg');
+            if ( ! is_string($algorithm)) {
+                throw new RuntimeException('Invalid algorithm.');
+            }
+
+            $algorithms[] = $algorithm;
+        }
+
+        return $algorithms;
     }
 }
